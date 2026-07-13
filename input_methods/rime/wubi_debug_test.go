@@ -11,7 +11,7 @@ import (
 func TestDebugWubiSequences(t *testing.T) {
 	userDir := filepath.Clean(`C:\Users\gbl\AppData\Roaming\Moqi\rime-wubi86-jidian`)
 	if info, err := os.Stat(userDir); err != nil || !info.IsDir() {
-		t.Fatalf("user dir unavailable: %q err=%v", userDir, err)
+		t.Skipf("user dir unavailable: %q err=%v", userDir, err)
 	}
 
 	dataDirCandidates := []string{
@@ -27,7 +27,7 @@ func TestDebugWubiSequences(t *testing.T) {
 		}
 	}
 	if dataDir == "" {
-		t.Fatal("usable Rime data directory is required")
+		t.Skip("usable Rime data directory is required")
 	}
 
 	if !RimeInit(dataDir, userDir, APP, APP_VERSION, false) {

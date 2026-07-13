@@ -38,10 +38,10 @@ func TestProbeSentenceCandidates(t *testing.T) {
 	installedDataDir := filepath.Join(`C:\Program Files (x86)\MoqiIM\moqi-ime`, "input_methods", "rime", "data")
 	userDir := filepath.Join(`C:\Users\gbl\AppData\Roaming`, APP, "Rime")
 	if info, err := os.Stat(installedDataDir); err != nil || !info.IsDir() {
-		t.Fatalf("installed data dir missing: %q", installedDataDir)
+		t.Skipf("installed data dir missing: %q", installedDataDir)
 	}
 	if info, err := os.Stat(userDir); err != nil || !info.IsDir() {
-		t.Fatalf("user dir missing: %q", userDir)
+		t.Skipf("user dir missing: %q", userDir)
 	}
 
 	probeRoot, err := os.MkdirTemp("", "moqi-rime-probe-*")
@@ -54,7 +54,7 @@ func TestProbeSentenceCandidates(t *testing.T) {
 	repoDLL := filepath.Join(`D:\vscode\moqi-input-method-projs\moqi-ime`, "input_methods", "rime", "rime.dll")
 	dllBytes, err := os.ReadFile(repoDLL)
 	if err != nil {
-		t.Fatalf("ReadFile(%q) failed: %v", repoDLL, err)
+		t.Skipf("ReadFile(%q) failed: %v", repoDLL, err)
 	}
 	if err := os.WriteFile(filepath.Join(probeRoot, "rime.dll"), dllBytes, 0o644); err != nil {
 		t.Fatalf("WriteFile(rime.dll) failed: %v", err)
