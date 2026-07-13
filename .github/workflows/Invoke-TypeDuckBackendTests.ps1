@@ -40,18 +40,53 @@
     code we DO own, so rather than skipping the package we run our own tests out of it by exact
     name.
 
-    THE COVERAGE GUARD (bidirectional)
-    ----------------------------------
+    THE COVERAGE GUARD (bidirectional, plus a self-check on the domain itself)
+    -------------------------------------------------------------------------
     A `-run` pattern that matches nothing still exits 0, so a typo, a renamed test, or a brand-new
     test nobody listed would quietly turn this into a no-op that tests nothing. The guard closes
-    BOTH directions:
+    every direction:
 
-      (a) STALENESS  -- every name in $FeatureTests and $KnownUpstreamRed must actually exist in
-                        the package. A deleted/renamed test fails the build.
-      (b) COMPLETENESS -- every test in the package whose name matches the feature domain
-                        ($DomainPattern: Shift / Ascii / asciiMode / SharedInputState) must be in
-                        EXACTLY ONE of the two lists. A 21st feature test that nobody listed fails
-                        the build with an actionable message instead of never running.
+      (a) STALENESS    -- every name in $FeatureTests and $KnownUpstreamRed must actually exist in
+                          the package. A deleted/renamed test fails the build.
+      (b) IN-DOMAIN    -- every name in $FeatureTests and $KnownUpstreamRed must be DISCOVERABLE by
+                          $DomainPattern. See "WHY (b) EXISTS" below. This is what makes the domain
+                          pattern honest instead of decorative.
+      (c) COMPLETENESS -- every test in the package that $DomainPattern discovers must be in EXACTLY
+                          ONE of the two lists. A new feature test that nobody listed fails the
+                          build with an actionable message instead of never running.
+
+    (a) + (b) + (c) together pin the invariant:
+
+        { tests discovered by $DomainPattern } == $FeatureTests + $KnownUpstreamRed   (as SETS)
+
+    WHY (b) EXISTS
+    --------------
+    Before (b), the two lists could name a test that $DomainPattern could not see, and nothing
+    complained -- the test ran, so it looked fine. It was not fine. It meant the ALLOWLIST was
+    carrying the test while DISCOVERY was blind to it, so a NEW test in that same vocabulary that
+    nobody hand-listed would never be discovered, never be run, and CI would still pass. That is the
+    exact hole the guard exists to close, reopened one rename at a time.
+    Two real tests were in that position -- TestCapsLockStillForwardedToRime and
+    TestOnCommandModeIconTogglePersistsWithoutExistingSession -- listed, running, invisible to a
+    domain of (shift|ascii|sharedinputstate). They were in the allowlist by luck.
+    (b) turns that from luck into an enforced rule: if you add a test to either list and its name is
+    outside the domain vocabulary, the build fails and tells you to either RENAME THE TEST into the
+    vocabulary or WIDEN $DomainPattern. Either way discovery and the lists can never drift apart
+    again.
+
+    CASE SENSITIVITY (this bit is a trap)
+    -------------------------------------
+    Go test names are case-SENSITIVE; PowerShell's -contains / -notcontains / -eq / -match and
+    Where-Object string comparisons are all case-INsensitive by DEFAULT. Mixing the two means
+    `TestFooBar` and `TestFoobar` collapse into one entry, and a test could be "classified" by an
+    allowlist entry that is not actually its name -- evading the guard while looking listed.
+    So: every comparison that CLASSIFIES a test name uses the case-sensitive operator
+    (-ccontains / -cnotcontains / -cmatch / -cnotmatch, and Sort-Object -Unique -CaseSensitive).
+
+    $DomainPattern itself stays case-INsensitive on purpose. It is a Go regexp handed to
+    `go test -list`, and DISCOVERY must over-approximate: `(?i)` also catches `TestCapslock...` and
+    `TestCAPSLOCK...`, which then have to be classified case-sensitively. Widening discovery is the
+    safe direction; widening classification is not.
 
     Test discovery uses `go test -list` (the compiled test registry), never a grep of the source.
 #>
@@ -128,6 +163,14 @@ $FeatureTests = @(
     'TestHandleRequestSyncsSharedInputStateAcrossInstances'
     'TestCreateSessionAppliesSharedInputStateOnlyForNewSession'
     'TestCreateSessionAppliesSharedInputStateAfterSharedConfigUpdateWithExistingSession'
+
+    # Surfaced by widening the domain from `sharedinputstate` to `inputstate`: its name says
+    # InputStateSharedToggle, not SharedInputState, so the old pattern could not see it. It drives
+    # ascii_mode through inputStateShared + captureSharedInputStateFromBackend -- the exact sync
+    # machinery the Shift toggle mutates -- and asserts always-synced switcher options (emoji) still
+    # cross instances while ascii_mode does NOT when input-state sharing is off. Pure-Go testBackend
+    # fake, green on a clean checkout.
+    'TestAlwaysSyncedSwitcherOptionsIgnoreInputStateSharedToggle'
 )
 
 # ---------------------------------------------------------------------------------------------
@@ -152,9 +195,31 @@ $KnownUpstreamRed = @(
     'TestFilterKeyDownEmitsLangButtonUpdateWhenControlHotkeyTogglesAsciiMode'
 )
 
-# Broad, case-insensitive feature-domain pattern. Anything in input_methods/rime matching this is
-# in scope for the completeness guard and must be classified into one of the two lists above.
-$DomainPattern = '(?i)(shift|ascii|sharedinputstate)'
+# ---------------------------------------------------------------------------------------------
+# THE FEATURE DOMAIN -- the vocabulary of the Shift/asciiMode feature, as a Go regexp.
+#
+# Anything in input_methods/rime whose test name matches this is in scope and must be classified
+# into exactly one of the two lists above (check (c)); conversely nothing in those two lists may
+# fall OUTSIDE it (check (b)). Case-insensitive ON PURPOSE -- see "CASE SENSITIVITY" in the header:
+# discovery over-approximates, classification does not.
+#
+# Every token below is load-bearing, and each is as NARROW as it can be while still covering the
+# feature's real vocabulary:
+#
+#   shift        the toggle itself.
+#   ascii        asciiMode / ascii_mode, the state it toggles.
+#   capslock     CapsLock is the key we must keep FORWARDING to rime while Shift is intercepted;
+#                a CapsLock regression is a regression of this feature. NOT the bare token `caps` --
+#                that also drags in TestBuildMenuCapsPerRowHighlightByCandidateCount ("CapsPerRow"),
+#                a candidate-layout test we do not own.
+#   modeicon     the tray/mode icon reflects and toggles the same ascii_mode state.
+#   inputstate   the shared input state the toggle mutates and propagates across instances.
+#                Deliberately WIDER than the old `sharedinputstate`: that spelling missed
+#                TestAlwaysSyncedSwitcherOptionsIgnoreInputStateSharedToggle, which is squarely ours.
+#
+# Adding a token? Re-run and confirm it does not drag in tests we do not own -- a false positive
+# here forces an unrelated author to classify a test they never touched.
+$DomainPattern = '(?i)(shift|ascii|capslock|modeicon|inputstate)'
 
 Push-Location -LiteralPath $RepoRoot
 try {
@@ -165,7 +230,8 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw 'go list ./... failed.'
     }
-    $packages = @($allPackages | Where-Object { $_ -notmatch '/input_methods/rime$' })
+    # -cnotmatch: Go import paths are case-sensitive, so the exclusion must be too.
+    $packages = @($allPackages | Where-Object { $_ -cnotmatch '/input_methods/rime$' })
     if ($packages.Count -eq 0) {
         throw 'go list ./... returned no packages.'
     }
@@ -177,18 +243,36 @@ try {
     }
 
     # -----------------------------------------------------------------------------------------
-    # 2. The bidirectional coverage guard on input_methods/rime.
+    # 2. The coverage guard on input_methods/rime.
+    #    (a) STALENESS  : listed  => exists          (c) COMPLETENESS: discovered => listed
+    #    (b) IN-DOMAIN  : listed  => discoverable    => together: discovered == listed, as SETS.
+    #    Every name comparison below is CASE-SENSITIVE; see the header. Go test names are.
     # -----------------------------------------------------------------------------------------
-    if (($FeatureTests | Sort-Object -Unique).Count -ne $FeatureTests.Count) {
+    # -CaseSensitive: without it Sort-Object -Unique folds 'TestFoo' and 'Testfoo' together and this
+    # check would report a duplicate that is not one (and, worse, teach the reader that these lists
+    # are case-insensitive -- they are not).
+    # The @(...) around each pipeline is load-bearing: Sort-Object on a ONE-element list returns a
+    # scalar, and under Set-StrictMode -Version Latest `.Count` on a scalar string throws
+    # "The property 'Count' cannot be found on this object". $KnownUpstreamRed currently has exactly
+    # one entry, so this is not hypothetical.
+    if (@($FeatureTests | Sort-Object -Unique -CaseSensitive).Count -ne @($FeatureTests).Count) {
         throw 'The run allowlist ($FeatureTests) contains duplicate entries.'
     }
-    $overlap = @($FeatureTests | Where-Object { $KnownUpstreamRed -contains $_ })
+    if (@($KnownUpstreamRed | Sort-Object -Unique -CaseSensitive).Count -ne @($KnownUpstreamRed).Count) {
+        throw 'The KNOWN-UPSTREAM-RED denylist ($KnownUpstreamRed) contains duplicate entries.'
+    }
+    # -ccontains: two tests differing only in case are two DIFFERENT Go tests.
+    $overlap = @($FeatureTests | Where-Object { $KnownUpstreamRed -ccontains $_ })
     if ($overlap.Count -gt 0) {
         throw "These tests are in BOTH the run allowlist and the KNOWN-UPSTREAM-RED denylist: $($overlap -join ', ')"
     }
 
+    $listedTests = @($FeatureTests) + @($KnownUpstreamRed)
+
     # Full test registry of the package, straight from the compiled test binary.
-    $allTests = @(go test -list '.*' $rimePackage | Where-Object { $_ -match '^Test' })
+    # -cmatch '^Test': `go test -list` also emits Benchmark*/Fuzz*/Example* entries and a trailing
+    # `ok <pkg> <time>` line; only real tests may pass, and only with a capital T.
+    $allTests = @(go test -list '.*' $rimePackage | Where-Object { $_ -cmatch '^Test' })
     if ($LASTEXITCODE -ne 0) {
         throw "go test -list failed for $rimePackage."
     }
@@ -197,7 +281,7 @@ try {
     }
 
     # (a) STALENESS -- both lists may only name tests that still exist.
-    $missing = @($FeatureTests | Where-Object { $allTests -notcontains $_ })
+    $missing = @($FeatureTests | Where-Object { $allTests -cnotcontains $_ })
     if ($missing.Count -gt 0) {
         Stop-WithDiagnostic -Summary 'stale run allowlist -- listed test(s) no longer exist in input_methods/rime' -Detail (
             $missing + @(
@@ -207,7 +291,7 @@ try {
             )
         )
     }
-    $staleRed = @($KnownUpstreamRed | Where-Object { $allTests -notcontains $_ })
+    $staleRed = @($KnownUpstreamRed | Where-Object { $allTests -cnotcontains $_ })
     if ($staleRed.Count -gt 0) {
         Stop-WithDiagnostic -Summary 'stale KNOWN-UPSTREAM-RED denylist -- listed test(s) no longer exist in input_methods/rime' -Detail (
             $staleRed + @(
@@ -218,9 +302,8 @@ try {
         )
     }
 
-    # (b) COMPLETENESS -- every in-domain test must be classified. This is the direction that used
-    #     to be missing: a new Shift/asciiMode test that nobody listed would simply never run.
-    $domainTests = @(go test -list $DomainPattern $rimePackage | Where-Object { $_ -match '^Test' })
+    # Everything $DomainPattern can SEE. Both remaining checks are about this set.
+    $domainTests = @(go test -list $DomainPattern $rimePackage | Where-Object { $_ -cmatch '^Test' })
     if ($LASTEXITCODE -ne 0) {
         throw "go test -list failed for $rimePackage (domain pattern)."
     }
@@ -228,8 +311,43 @@ try {
         throw "go test -list matched no feature-domain tests in $rimePackage; the guard would be a no-op."
     }
 
+    # (b) IN-DOMAIN -- nothing we own may sit OUTSIDE what discovery can see.
+    #     Reached only after (a), so these tests are known to EXIST: being invisible here therefore
+    #     means the NAME is outside the domain vocabulary, not that the test is gone.
+    #     Without this check the lists silently become the only thing keeping such a test alive, and
+    #     the next test named like it is never discovered and never runs. -cnotcontains: a listed
+    #     name that differs from the discovered one only by case is NOT that test.
+    $outOfDomain = @($listedTests | Where-Object { $domainTests -cnotcontains $_ })
+    if ($outOfDomain.Count -gt 0) {
+        Stop-WithDiagnostic -Summary "listed test(s) that `$DomainPattern cannot discover: $($outOfDomain -join ', ')" -Detail (
+            $outOfDomain + @(
+                '',
+                'These tests are in a list, so they RUN -- but the domain pattern',
+                "  $DomainPattern",
+                'cannot see them. That makes the pattern a lie: a NEW test named in the same',
+                'vocabulary would be discovered by nobody, listed by nobody, and would never run,',
+                'while CI stayed green. That is the exact hole this guard exists to close.',
+                '',
+                'Fix it in one of these two ways, in:',
+                "  $PSCommandPath",
+                '',
+                '  * RENAME the test into the domain vocabulary (preferred -- keeps the domain tight), or',
+                '  * WIDEN $DomainPattern to cover it, then re-run and confirm the wider pattern does',
+                '    not drag in tests this feature does not own.',
+                '',
+                'Refusing to build: a test the domain cannot discover is a hole in the domain.'
+            )
+        )
+    }
+
+    # (c) COMPLETENESS -- every in-domain test must be classified. A new Shift/asciiMode test that
+    #     nobody listed would otherwise simply never run.
+    #     -cnotcontains, twice: with the case-INsensitive -notcontains, a test named
+    #     TestCapsLockStillForwardedToRIME would be "classified" by the allowlist entry
+    #     TestCapsLockStillForwardedToRime -- a DIFFERENT Go test -- and would evade the guard
+    #     entirely while the real one kept running in its place.
     $unclassified = @($domainTests | Where-Object {
-        ($FeatureTests -notcontains $_) -and ($KnownUpstreamRed -notcontains $_)
+        ($FeatureTests -cnotcontains $_) -and ($KnownUpstreamRed -cnotcontains $_)
     })
     if ($unclassified.Count -gt 0) {
         Stop-WithDiagnostic -Summary "unclassified Shift/asciiMode test(s) in input_methods/rime: $($unclassified -join ', ')" -Detail (
@@ -242,9 +360,18 @@ try {
                 '  * $FeatureTests     -- the run allowlist. Put it here if it should pass (normal case).',
                 '  * $KnownUpstreamRed -- the denylist, WITH A COMMENT saying why it is not our problem.',
                 '',
+                'Names are compared CASE-SENSITIVELY, because Go test names are. If this test looks',
+                'like it is already listed, check the capitalisation: it is a different test.',
+                '',
                 'Refusing to build: an unlisted test is a test that never runs.'
             )
         )
+    }
+
+    # (a)+(b)+(c) hold, so the discovered domain and the two lists are now the same SET.
+    # Assert it outright -- if this ever fires, one of the three checks above has a bug.
+    if ($domainTests.Count -ne $listedTests.Count) {
+        throw "Guard invariant broken: $($domainTests.Count) discovered in-domain test(s) but $($listedTests.Count) listed. This is a bug in the guard itself."
     }
 
     Write-Host "Coverage guard OK: $($domainTests.Count) feature-domain test(s) in input_methods/rime -- $($FeatureTests.Count) allowlisted, $($KnownUpstreamRed.Count) known-upstream-red."
@@ -255,7 +382,7 @@ try {
     # Fully anchored alternation: it cannot partially match an upstream test name.
     $runPattern = '^(' + ($FeatureTests -join '|') + ')$'
 
-    $selected = @(go test -list $runPattern $rimePackage | Where-Object { $_ -match '^Test' })
+    $selected = @(go test -list $runPattern $rimePackage | Where-Object { $_ -cmatch '^Test' })
     if ($LASTEXITCODE -ne 0) {
         throw "go test -list failed for $rimePackage (run pattern)."
     }
