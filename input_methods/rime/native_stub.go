@@ -116,3 +116,13 @@ func RimeRedeploy(datadir, userdir, appname, appver string) bool { return false 
 func RimeReloadIncremental(datadir, userdir, appname, appver string) bool {
 	return false
 }
+
+var rimeRedeployFunc = RimeRedeploy
+
+var rimeInitOK bool
+
+func resetNativeRuntimeStateForTest() {}
+
+func typeDuckRimeModules() []string {
+	return []string{"default", "levers", "dictionary_lookup"}
+}

@@ -209,10 +209,6 @@ func (b *testBackend) ProcessKey(req *imecore.Request, translatedKeyCode, modifi
 	if charCode == 0 && keyCode >= 'A' && keyCode <= 'Z' {
 		charCode = keyCode + 32
 	}
-	if keyCode == vkShift && modifiers == releaseMask {
-		b.SetOption("ascii_mode", !b.GetOption("ascii_mode"))
-		return false
-	}
 	if keyCode == vkCapital && modifiers&releaseMask == 0 {
 		b.SetOption("ascii_mode", !b.GetOption("ascii_mode"))
 		return true
@@ -516,6 +512,32 @@ func newIsolatedTestIME(t *testing.T) *IME {
 	resetSharedAppearanceConfigForTest()
 	resetSchemeSetVersionForTest()
 	return newTestIME()
+}
+
+func shiftKeyRequest(seq int, ctrl, alt bool) *imecore.Request {
+	states := make(imecore.KeyStates, 256)
+	if ctrl {
+		states[vkControl] |= 0x80
+	}
+	if alt {
+		states[vkMenu] |= 0x80
+	}
+	return &imecore.Request{SeqNum: seq, KeyCode: vkShift, KeyStates: states}
+}
+
+func typeTestLetters(t *testing.T, ime *IME, seq int, letters string) {
+	t.Helper()
+	for i, ch := range letters {
+		resp := ime.filterKeyDown(&imecore.Request{
+			SeqNum:    seq + i,
+			KeyCode:   int(ch) - 32,
+			CharCode:  int(ch),
+			KeyStates: make(imecore.KeyStates, 256),
+		}, imecore.NewResponse(seq+i, true))
+		if resp.ReturnValue != 1 {
+			t.Fatalf("expected letter %q handled, got %d", string(ch), resp.ReturnValue)
+		}
+	}
 }
 
 func TestNewInitialState(t *testing.T) {
@@ -3918,26 +3940,32 @@ func TestHandleRequestUsesSchemaRecordedForCurrentSchemeSet(t *testing.T) {
 func TestProcessKeySyncsSharedInputStateAfterShiftAndCapsToggle(t *testing.T) {
 	testCases := []struct {
 		name     string
-		req      *imecore.Request
-		isUp     bool
+		toggle   func(t *testing.T, ime *IME)
 		expected bool
 	}{
 		{
+			// Bare Shift is intercepted by the toggle state machine before
+			// processKey; drive the filter events instead.
 			name: "shift",
-			req: &imecore.Request{
-				KeyCode:   vkShift,
-				KeyStates: make(imecore.KeyStates, 256),
+			toggle: func(t *testing.T, ime *IME) {
+				t.Helper()
+				ime.filterKeyDown(shiftKeyRequest(180, false, false), imecore.NewResponse(180, true))
+				resp := ime.filterKeyUp(shiftKeyRequest(181, false, false), imecore.NewResponse(181, true))
+				if resp.ReturnValue != 1 {
+					t.Fatalf("expected toggling Shift-up eaten, got %d", resp.ReturnValue)
+				}
 			},
-			isUp:     true,
 			expected: true,
 		},
 		{
 			name: "caps",
-			req: &imecore.Request{
-				KeyCode:   vkCapital,
-				KeyStates: make(imecore.KeyStates, 256),
+			toggle: func(t *testing.T, ime *IME) {
+				t.Helper()
+				ime.processKey(&imecore.Request{
+					KeyCode:   vkCapital,
+					KeyStates: make(imecore.KeyStates, 256),
+				}, false)
 			},
-			isUp:     false,
 			expected: true,
 		},
 	}
@@ -3952,7 +3980,7 @@ func TestProcessKeySyncsSharedInputStateAfterShiftAndCapsToggle(t *testing.T) {
 			first.captureSharedInputStateFromBackend()
 			first.saveAppearancePrefs()
 
-			first.processKey(tc.req, tc.isUp)
+			tc.toggle(t, first)
 			if got := first.backend.GetOption("ascii_mode"); got != tc.expected {
 				t.Fatalf("expected first instance ascii_mode=%t after %s toggle, got %t", tc.expected, tc.name, got)
 			}
@@ -4384,5 +4412,565 @@ func TestTypeDuckRimeModulesIncludeDictionaryLookup(t *testing.T) {
 	}
 	if !slices.Contains(modules, "dictionary_lookup") {
 		t.Fatalf("expected dictionary_lookup module for dictionary_lookup_filter, got %#v", modules)
+	}
+}
+
+func TestBareShiftDownPassesThroughAndIsNotForwardedToRime(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	backend := ime.backend.(*testBackend)
+
+	resp := ime.filterKeyDown(shiftKeyRequest(300, false, false), imecore.NewResponse(300, true))
+
+	if resp.ReturnValue != 0 {
+		t.Fatalf("expected bare Shift-down to pass through, got %d", resp.ReturnValue)
+	}
+	for _, code := range backend.translatedKeyCodes {
+		if code == rimeShiftL || code == rimeShiftR {
+			t.Fatalf("expected bare Shift-down not forwarded to rime, got %v", backend.translatedKeyCodes)
+		}
+	}
+	if !ime.shiftTogglePending {
+		t.Fatal("expected bare Shift-down to arm the toggle")
+	}
+}
+
+func TestLoneLeftShiftTogglesAsciiMode(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	ime.inputStateShared = true
+
+	iconDir := t.TempDir()
+	for _, name := range []string{"chi.ico", "eng.ico"} {
+		if err := os.WriteFile(filepath.Join(iconDir, name), []byte{}, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	ime.iconDir = iconDir
+
+	downResp := ime.filterKeyDown(shiftKeyRequest(301, false, false), imecore.NewResponse(301, true))
+	if downResp.ReturnValue != 0 {
+		t.Fatalf("expected Shift-down to pass through, got %d", downResp.ReturnValue)
+	}
+
+	upResp := ime.filterKeyUp(shiftKeyRequest(302, false, false), imecore.NewResponse(302, true))
+	if upResp.ReturnValue != 1 {
+		t.Fatalf("expected toggling Shift-up eaten, got %d", upResp.ReturnValue)
+	}
+	if !ime.backend.GetOption("ascii_mode") {
+		t.Fatal("expected ascii_mode enabled after lone Shift")
+	}
+	if upResp.TypeDuckSettingsUpdate == nil || upResp.TypeDuckSettingsUpdate.AsciiMode == nil || !*upResp.TypeDuckSettingsUpdate.AsciiMode {
+		t.Fatalf("expected settings update with ascii_mode=true, got %#v", upResp.TypeDuckSettingsUpdate)
+	}
+	langIcon := ""
+	for _, btn := range upResp.ChangeButton {
+		if btn.ID == "switch-lang" {
+			langIcon = filepath.Base(btn.Icon)
+		}
+	}
+	if langIcon != "eng.ico" {
+		t.Fatalf("expected eng.ico language button update, got %q (%#v)", langIcon, upResp.ChangeButton)
+	}
+
+	onResp := ime.onKeyUp(shiftKeyRequest(303, false, false), imecore.NewResponse(303, true))
+	if onResp.ReturnValue != 1 {
+		t.Fatalf("expected onKeyUp to eat the toggling Shift-up, got %d", onResp.ReturnValue)
+	}
+	if onResp.CompositionString != "" || len(onResp.CandidateList) != 0 || onResp.ShowCandidates {
+		t.Fatalf("expected empty composition and candidates, got %#v", onResp)
+	}
+}
+
+func TestLoneRightShiftTogglesAsciiMode(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	ime.inputStateShared = true
+
+	down := shiftKeyRequest(304, false, false)
+	down.KeyStates[vkRShift] |= 1
+	if resp := ime.filterKeyDown(down, imecore.NewResponse(304, true)); resp.ReturnValue != 0 {
+		t.Fatalf("expected right Shift-down to pass through, got %d", resp.ReturnValue)
+	}
+
+	up := shiftKeyRequest(305, false, false)
+	up.KeyStates[vkRShift] |= 1
+	upResp := ime.filterKeyUp(up, imecore.NewResponse(305, true))
+	if upResp.ReturnValue != 1 {
+		t.Fatalf("expected right Shift-up eaten, got %d", upResp.ReturnValue)
+	}
+	if !ime.backend.GetOption("ascii_mode") {
+		t.Fatal("expected ascii_mode enabled after lone right Shift")
+	}
+
+	onUp := shiftKeyRequest(306, false, false)
+	onUp.KeyStates[vkRShift] |= 1
+	if resp := ime.onKeyUp(onUp, imecore.NewResponse(306, true)); resp.ReturnValue != 1 {
+		t.Fatalf("expected onKeyUp eaten for right Shift, got %d", resp.ReturnValue)
+	}
+}
+
+func TestShiftWithLetterDoesNotToggle(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+
+	ime.filterKeyDown(shiftKeyRequest(310, false, false), imecore.NewResponse(310, true))
+
+	letterStates := make(imecore.KeyStates, 256)
+	letterStates[vkShift] |= 0x80
+	letterResp := ime.filterKeyDown(&imecore.Request{
+		SeqNum:    311,
+		KeyCode:   int('N'),
+		CharCode:  int('N'),
+		KeyStates: letterStates,
+	}, imecore.NewResponse(311, true))
+	if letterResp.ReturnValue != 0 {
+		t.Fatalf("expected uppercase letter to pass through in Chinese mode, got %d", letterResp.ReturnValue)
+	}
+
+	upResp := ime.filterKeyUp(shiftKeyRequest(312, false, false), imecore.NewResponse(312, true))
+	if upResp.ReturnValue != 0 {
+		t.Fatalf("expected cancelled Shift-up to pass through, got %d", upResp.ReturnValue)
+	}
+	if ime.backend.GetOption("ascii_mode") {
+		t.Fatal("expected ascii_mode unchanged after Shift+letter")
+	}
+	if upResp.TypeDuckSettingsUpdate != nil {
+		t.Fatalf("expected no settings update on cancelled Shift, got %#v", upResp.TypeDuckSettingsUpdate)
+	}
+}
+
+func TestCtrlShiftDoesNotToggle(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	backend := ime.backend.(*testBackend)
+
+	downResp := ime.filterKeyDown(shiftKeyRequest(315, true, false), imecore.NewResponse(315, true))
+	upResp := ime.filterKeyUp(shiftKeyRequest(316, true, false), imecore.NewResponse(316, true))
+
+	if ime.backend.GetOption("ascii_mode") {
+		t.Fatal("expected ascii_mode unchanged after Ctrl+Shift")
+	}
+	if !slices.Contains(backend.translatedKeyCodes, rimeShiftL) {
+		t.Fatalf("expected chorded Shift forwarded to rime, got %v", backend.translatedKeyCodes)
+	}
+	if downResp.TypeDuckSettingsUpdate != nil || upResp.TypeDuckSettingsUpdate != nil {
+		t.Fatal("expected no settings update on Ctrl+Shift chord")
+	}
+}
+
+func TestShiftAutoRepeatTogglesOnce(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	ime.inputStateShared = true
+
+	for seq := 320; seq <= 322; seq++ {
+		ime.filterKeyDown(shiftKeyRequest(seq, false, false), imecore.NewResponse(seq, true))
+	}
+
+	upResp := ime.filterKeyUp(shiftKeyRequest(323, false, false), imecore.NewResponse(323, true))
+	if upResp.ReturnValue != 1 {
+		t.Fatalf("expected Shift-up after auto-repeat downs to toggle once, got %d", upResp.ReturnValue)
+	}
+	if !ime.backend.GetOption("ascii_mode") {
+		t.Fatal("expected ascii_mode enabled")
+	}
+	if onResp := ime.onKeyUp(shiftKeyRequest(324, false, false), imecore.NewResponse(324, true)); onResp.ReturnValue != 1 {
+		t.Fatalf("expected onKeyUp eaten, got %d", onResp.ReturnValue)
+	}
+
+	secondUp := ime.filterKeyUp(shiftKeyRequest(325, false, false), imecore.NewResponse(325, true))
+	if secondUp.ReturnValue != 0 {
+		t.Fatalf("expected second Shift-up without a down to pass through, got %d", secondUp.ReturnValue)
+	}
+	if !ime.backend.GetOption("ascii_mode") {
+		t.Fatal("expected second Shift-up not to toggle back")
+	}
+}
+
+func TestShiftToggleWithCompositionCommitsRawInput(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	ime.inputStateShared = true
+	backend := ime.backend.(*testBackend)
+
+	typeTestLetters(t, ime, 330, "nihao")
+	backend.rawInput = "nihao"
+	if len(backend.candidates) == 0 || backend.candidates[0].Text != "你好" {
+		t.Fatalf("expected 你好 highlighted before toggling, got %#v", backend.candidates)
+	}
+
+	ime.filterKeyDown(shiftKeyRequest(340, false, false), imecore.NewResponse(340, true))
+	upResp := ime.filterKeyUp(shiftKeyRequest(341, false, false), imecore.NewResponse(341, true))
+	if upResp.ReturnValue != 1 {
+		t.Fatalf("expected toggling Shift-up eaten, got %d", upResp.ReturnValue)
+	}
+
+	onResp := ime.onKeyUp(shiftKeyRequest(342, false, false), imecore.NewResponse(342, true))
+	if onResp.ReturnValue != 1 {
+		t.Fatalf("expected onKeyUp eaten, got %d", onResp.ReturnValue)
+	}
+	if onResp.CommitString != "nihao" {
+		t.Fatalf("expected raw letters committed, got %q", onResp.CommitString)
+	}
+	if onResp.CompositionString != "" || len(onResp.CandidateList) != 0 || onResp.ShowCandidates {
+		t.Fatalf("expected cleared composition and candidates, got %#v", onResp)
+	}
+	if backend.composition != "" {
+		t.Fatalf("expected backend composition cleared, got %q", backend.composition)
+	}
+	if !ime.backend.GetOption("ascii_mode") {
+		t.Fatal("expected ascii_mode enabled")
+	}
+}
+
+func TestShiftToggleBackToChineseAllowsComposing(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	ime.inputStateShared = true
+	ime.backend.SetOption("ascii_mode", true)
+
+	ime.filterKeyDown(shiftKeyRequest(350, false, false), imecore.NewResponse(350, true))
+	upResp := ime.filterKeyUp(shiftKeyRequest(351, false, false), imecore.NewResponse(351, true))
+	if upResp.ReturnValue != 1 {
+		t.Fatalf("expected toggling Shift-up eaten, got %d", upResp.ReturnValue)
+	}
+	if ime.backend.GetOption("ascii_mode") {
+		t.Fatal("expected ascii_mode disabled after toggle back")
+	}
+	ime.onKeyUp(shiftKeyRequest(352, false, false), imecore.NewResponse(352, true))
+
+	letterResp := ime.filterKeyDown(&imecore.Request{
+		SeqNum:    353,
+		KeyCode:   0x4E,
+		CharCode:  'n',
+		KeyStates: make(imecore.KeyStates, 256),
+	}, imecore.NewResponse(353, true))
+	if letterResp.ReturnValue != 1 {
+		t.Fatalf("expected composing to resume in Chinese mode, got %d", letterResp.ReturnValue)
+	}
+}
+
+func TestShiftToggleResponseCarriesSettingsUpdateOnlyOnToggle(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+
+	upResp := ime.filterKeyUp(shiftKeyRequest(360, false, false), imecore.NewResponse(360, true))
+	if upResp.ReturnValue != 0 {
+		t.Fatalf("expected non-toggling Shift-up to pass through, got %d", upResp.ReturnValue)
+	}
+	if upResp.TypeDuckSettingsUpdate != nil {
+		t.Fatalf("expected no settings update on non-toggling Shift-up, got %#v", upResp.TypeDuckSettingsUpdate)
+	}
+
+	letterResp := ime.filterKeyDown(&imecore.Request{
+		SeqNum:    361,
+		KeyCode:   0x4E,
+		CharCode:  'n',
+		KeyStates: make(imecore.KeyStates, 256),
+	}, imecore.NewResponse(361, true))
+	if letterResp.TypeDuckSettingsUpdate != nil {
+		t.Fatalf("expected no settings update on plain letter, got %#v", letterResp.TypeDuckSettingsUpdate)
+	}
+}
+
+func TestSettingsUpdateAsciiModeAppliesWithoutRedeploy(t *testing.T) {
+	oldCustomize := customizeTypeDuckSettingsFunc
+	oldReload := reloadTypeDuckSettingsFunc
+	customizeCalls := 0
+	reloadCalls := 0
+	customizeTypeDuckSettingsFunc = func(prefs typeDuckRimePreferences) bool {
+		customizeCalls++
+		return true
+	}
+	reloadTypeDuckSettingsFunc = func(sharedDir, userDir, appname, appver string) bool {
+		reloadCalls++
+		return true
+	}
+	defer func() {
+		customizeTypeDuckSettingsFunc = oldCustomize
+		reloadTypeDuckSettingsFunc = oldReload
+	}()
+
+	ime := newIsolatedTestIME(t)
+	ime.inputStateShared = true
+	backend := ime.backend.(*testBackend)
+
+	asciiMode := true
+	resp := ime.HandleRequest(&imecore.Request{
+		Method:           "typeduckSettingsUpdate",
+		SeqNum:           370,
+		TypeDuckSettings: &imecore.TypeDuckSettingsUpdate{AsciiMode: &asciiMode},
+	})
+
+	if !resp.Success || resp.ReturnValue != 1 {
+		t.Fatalf("expected ascii-only settings update success, got %#v", resp)
+	}
+	if !ime.backend.GetOption("ascii_mode") {
+		t.Fatal("expected ascii_mode applied as live engine option")
+	}
+	if backend.redeployCalls != 0 {
+		t.Fatalf("expected no redeploy for ascii-only update, got %d", backend.redeployCalls)
+	}
+	if customizeCalls != 0 || reloadCalls != 0 {
+		t.Fatalf("expected no yaml customize/reload for ascii-only update, got customize=%d reload=%d", customizeCalls, reloadCalls)
+	}
+	// Master-plan override: the applied value is echoed so the launcher
+	// persist hook converges (idempotent load-compare-save, no ping-pong).
+	if resp.TypeDuckSettingsUpdate == nil || resp.TypeDuckSettingsUpdate.AsciiMode == nil || !*resp.TypeDuckSettingsUpdate.AsciiMode {
+		t.Fatalf("expected applied ascii_mode echoed in response, got %#v", resp.TypeDuckSettingsUpdate)
+	}
+}
+
+func TestSettingsUpdateAsciiModePropagatesToExistingInstance(t *testing.T) {
+	t.Setenv("APPDATA", t.TempDir())
+	resetSharedAppearanceConfigForTest()
+	resetSchemeSetVersionForTest()
+
+	second := newTestIME()
+	second.inputStateShared = true
+	second.createSession(nil)
+
+	first := newTestIME()
+	first.inputStateShared = true
+	asciiMode := true
+	resp := first.HandleRequest(&imecore.Request{
+		Method:           "typeduckSettingsUpdate",
+		SeqNum:           380,
+		TypeDuckSettings: &imecore.TypeDuckSettingsUpdate{AsciiMode: &asciiMode},
+	})
+	if !resp.Success || resp.ReturnValue != 1 {
+		t.Fatalf("expected settings update success, got %#v", resp)
+	}
+
+	keyResp := second.HandleRequest(&imecore.Request{
+		Method:    "filterKeyDown",
+		SeqNum:    381,
+		KeyCode:   0x4E,
+		CharCode:  'n',
+		KeyStates: make(imecore.KeyStates, 256),
+	})
+	if !second.backend.GetOption("ascii_mode") {
+		t.Fatal("expected existing instance to pick up pushed ascii_mode")
+	}
+	if keyResp.ReturnValue != 0 {
+		t.Fatalf("expected letter to pass through in English mode, got %d", keyResp.ReturnValue)
+	}
+}
+
+func TestShiftTogglePropagatesAcrossInstances(t *testing.T) {
+	t.Setenv("APPDATA", t.TempDir())
+	resetSharedAppearanceConfigForTest()
+	resetSchemeSetVersionForTest()
+
+	second := newTestIME()
+	second.inputStateShared = true
+	second.createSession(nil)
+
+	first := newTestIME()
+	first.inputStateShared = true
+	first.filterKeyDown(shiftKeyRequest(390, false, false), imecore.NewResponse(390, true))
+	upResp := first.filterKeyUp(shiftKeyRequest(391, false, false), imecore.NewResponse(391, true))
+	if upResp.ReturnValue != 1 {
+		t.Fatalf("expected toggling Shift-up eaten, got %d", upResp.ReturnValue)
+	}
+
+	second.HandleRequest(&imecore.Request{
+		Method:    "filterKeyDown",
+		SeqNum:    392,
+		KeyCode:   0x4E,
+		CharCode:  'n',
+		KeyStates: make(imecore.KeyStates, 256),
+	})
+	if !second.backend.GetOption("ascii_mode") {
+		t.Fatal("expected second instance to pick up Shift toggle")
+	}
+}
+
+func TestShiftTogglePublishesAsciiModeWithoutSchemaSaveOptions(t *testing.T) {
+	// The deployed TypeDuck schema's switcher/save_options is
+	// [full_shape, ascii_punct] with no ascii_mode; cross-session publish
+	// must not depend on the schema listing it.
+	t.Setenv("APPDATA", t.TempDir())
+	resetSharedAppearanceConfigForTest()
+	resetSchemeSetVersionForTest()
+
+	second := newTestIME()
+	second.inputStateShared = true
+	second.backend.(*testBackend).saveOptions = []string{"full_shape", "ascii_punct"}
+	second.createSession(nil)
+
+	first := newTestIME()
+	first.inputStateShared = true
+	first.backend.(*testBackend).saveOptions = []string{"full_shape", "ascii_punct"}
+	first.filterKeyDown(shiftKeyRequest(480, false, false), imecore.NewResponse(480, true))
+	upResp := first.filterKeyUp(shiftKeyRequest(481, false, false), imecore.NewResponse(481, true))
+	if upResp.ReturnValue != 1 {
+		t.Fatalf("expected toggling Shift-up eaten, got %d", upResp.ReturnValue)
+	}
+
+	second.HandleRequest(&imecore.Request{
+		Method:    "filterKeyDown",
+		SeqNum:    482,
+		KeyCode:   0x4E,
+		CharCode:  'n',
+		KeyStates: make(imecore.KeyStates, 256),
+	})
+	if !second.backend.GetOption("ascii_mode") {
+		t.Fatal("expected Shift toggle to propagate without schema save_options listing ascii_mode")
+	}
+}
+
+func TestOnCommandModeIconTogglePersistsWithoutExistingSession(t *testing.T) {
+	// The mode-icon click may arrive before any key event created a session
+	// (forced composition termination, scheme-set version bump); the launcher
+	// persistence signal must still be attached.
+	ime := newIsolatedTestIME(t)
+	ime.backend.(*testBackend).saveOptions = []string{"full_shape", "ascii_punct"}
+
+	resp := ime.HandleRequest(&imecore.Request{
+		Method: "onCommand",
+		SeqNum: 470,
+		ID:     imecore.FlexibleID{Int: ID_MODE_ICON, IsInt: true},
+	})
+	if !ime.backend.GetOption("ascii_mode") {
+		t.Fatal("expected mode icon click to toggle ascii_mode")
+	}
+	if resp.TypeDuckSettingsUpdate == nil || resp.TypeDuckSettingsUpdate.AsciiMode == nil || !*resp.TypeDuckSettingsUpdate.AsciiMode {
+		t.Fatalf("expected settings update with ascii_mode=true, got %#v", resp.TypeDuckSettingsUpdate)
+	}
+}
+
+func TestNewSessionInheritsAsciiMode(t *testing.T) {
+	t.Setenv("APPDATA", t.TempDir())
+	resetSharedAppearanceConfigForTest()
+	resetSchemeSetVersionForTest()
+
+	first := newTestIME()
+	first.inputStateShared = true
+	first.filterKeyDown(shiftKeyRequest(400, false, false), imecore.NewResponse(400, true))
+	first.filterKeyUp(shiftKeyRequest(401, false, false), imecore.NewResponse(401, true))
+	if !first.backend.GetOption("ascii_mode") {
+		t.Fatal("expected ascii_mode enabled in first instance")
+	}
+
+	second := newTestIME()
+	second.loadAppearancePrefs()
+	if !second.inputStateShared {
+		t.Fatal("expected published config to enable input state sharing")
+	}
+	second.HandleRequest(&imecore.Request{
+		Method:    "filterKeyDown",
+		SeqNum:    402,
+		KeyCode:   0x4E,
+		CharCode:  'n',
+		KeyStates: make(imecore.KeyStates, 256),
+	})
+	if !second.backend.GetOption("ascii_mode") {
+		t.Fatal("expected new session to inherit ascii_mode")
+	}
+}
+
+func TestAsciiModeSurvivesRedeployAndSchemaSwitch(t *testing.T) {
+	t.Setenv("APPDATA", t.TempDir())
+	resetSharedAppearanceConfigForTest()
+	resetSchemeSetVersionForTest()
+
+	ime := newTestIME()
+	ime.inputStateShared = true
+	backend := ime.backend.(*testBackend)
+
+	ime.filterKeyDown(shiftKeyRequest(410, false, false), imecore.NewResponse(410, true))
+	ime.filterKeyUp(shiftKeyRequest(411, false, false), imecore.NewResponse(411, true))
+	if !backend.GetOption("ascii_mode") {
+		t.Fatal("expected ascii_mode enabled before redeploy")
+	}
+
+	deployResp := ime.HandleRequest(&imecore.Request{Method: "typeduckDeploy", SeqNum: 412})
+	if !deployResp.Success || deployResp.ReturnValue != 1 {
+		t.Fatalf("expected redeploy success, got %#v", deployResp)
+	}
+	if !backend.GetOption("ascii_mode") {
+		t.Fatal("expected ascii_mode to survive redeploy")
+	}
+
+	// Simulate the deploy-time switch reset (ascii_mode reset: 0); schema
+	// switching must reapply the shared value.
+	backend.SetOption("ascii_mode", false)
+	if !ime.selectSchemaByIDLocked("rime_frost_double_pinyin") {
+		t.Fatal("expected schema switch to succeed")
+	}
+	if !backend.GetOption("ascii_mode") {
+		t.Fatal("expected schema switch to reapply shared ascii_mode")
+	}
+}
+
+func TestShiftToggleDoesNotLogTypedContent(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	ime.inputStateShared = true
+	backend := ime.backend.(*testBackend)
+
+	var buf bytes.Buffer
+	oldOutput := log.Writer()
+	log.SetOutput(&buf)
+	SetDebugLoggingEnabled(true)
+	defer func() {
+		SetDebugLoggingEnabled(false)
+		log.SetOutput(oldOutput)
+	}()
+
+	typeTestLetters(t, ime, 420, "nihao")
+	backend.rawInput = "nihao"
+	ime.filterKeyDown(shiftKeyRequest(430, false, false), imecore.NewResponse(430, true))
+	ime.filterKeyUp(shiftKeyRequest(431, false, false), imecore.NewResponse(431, true))
+	onResp := ime.onKeyUp(shiftKeyRequest(432, false, false), imecore.NewResponse(432, true))
+	if onResp.CommitString != "nihao" {
+		t.Fatalf("expected raw letters committed, got %q", onResp.CommitString)
+	}
+
+	logText := buf.String()
+	if strings.Contains(logText, "nihao") {
+		t.Fatalf("expected typed letters not logged, got %q", logText)
+	}
+	if strings.Contains(logText, "你好") {
+		t.Fatalf("expected candidate text not logged, got %q", logText)
+	}
+}
+
+func TestCapsLockStillForwardedToRime(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	backend := ime.backend.(*testBackend)
+
+	resp := ime.filterKeyDown(&imecore.Request{
+		SeqNum:    440,
+		KeyCode:   vkCapital,
+		KeyStates: make(imecore.KeyStates, 256),
+	}, imecore.NewResponse(440, true))
+
+	if resp.ReturnValue != 1 {
+		t.Fatalf("expected Caps Lock handled by rime, got %d", resp.ReturnValue)
+	}
+	if !slices.Contains(backend.translatedKeyCodes, rimeCapsLock) {
+		t.Fatalf("expected Caps Lock forwarded to rime, got %v", backend.translatedKeyCodes)
+	}
+	if !ime.backend.GetOption("ascii_mode") {
+		t.Fatal("expected Caps Lock to toggle ascii inside rime")
+	}
+}
+
+func TestOnCommandAsciiToggleAttachesSettingsUpdate(t *testing.T) {
+	ime := newIsolatedTestIME(t)
+	ime.createSession(nil) // lang-bar clicks always happen with a live session
+
+	resp := ime.HandleRequest(&imecore.Request{
+		Method: "onCommand",
+		SeqNum: 450,
+		ID:     imecore.FlexibleID{Int: ID_ASCII_MODE, IsInt: true},
+	})
+	if resp.ReturnValue != 1 {
+		t.Fatalf("expected ascii command handled, got %d", resp.ReturnValue)
+	}
+	if resp.TypeDuckSettingsUpdate == nil || resp.TypeDuckSettingsUpdate.AsciiMode == nil || !*resp.TypeDuckSettingsUpdate.AsciiMode {
+		t.Fatalf("expected settings update with ascii_mode=true, got %#v", resp.TypeDuckSettingsUpdate)
+	}
+
+	other := ime.HandleRequest(&imecore.Request{
+		Method: "onCommand",
+		SeqNum: 451,
+		ID:     imecore.FlexibleID{Int: ID_FULL_SHAPE, IsInt: true},
+	})
+	if other.TypeDuckSettingsUpdate != nil {
+		t.Fatalf("expected no settings update for non-ascii command, got %#v", other.TypeDuckSettingsUpdate)
 	}
 }

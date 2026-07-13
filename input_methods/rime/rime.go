@@ -230,6 +230,9 @@ type IME struct {
 	customPhraseConsumeKeyUpCode int
 	superAbbrevConsumeKeyUpCode  int
 	secondSelectConsumeKeyUpCode int
+	shiftTogglePending           bool   // armed by bare Shift-down; cancelled by any other keydown
+	shiftToggleUpPending         bool   // toggle done in filterKeyUp; onKeyUp must emit the payload
+	shiftToggleCommitRaw         string // raw letters to commit in the onKeyUp edit session
 	cloudClipboardActive         bool
 	cloudClipboardPending        bool
 	cloudClipboardEntries        []cloudClipboardEntry
@@ -281,6 +284,7 @@ func New(client *imecore.Client) imecore.TextService {
 		style:            defaultStyle(),
 		aiResultCh:       make(chan aiAsyncResult, 4),
 		schemeSetVersion: currentSchemeSetVersion(),
+		inputStateShared: true,
 	}
 	ime.loadAppearancePrefs()
 	return ime
@@ -393,7 +397,20 @@ func (ime *IME) HandleRequest(req *imecore.Request) *imecore.Response {
 	case "onPreservedKey":
 		return ime.onPreservedKey(req, resp)
 	case "onCommand":
-		return ime.onCommand(req, resp)
+		beforeASCII, _, hadState := ime.currentInputModeState()
+		if !hadState {
+			// onCommand creates the session lazily and a fresh session
+			// inherits the shared input state, so that shared value is the
+			// true pre-command ascii state.
+			beforeASCII = ime.sharedOptions["ascii_mode"]
+		}
+		result := ime.onCommand(req, resp)
+		if ime.backend != nil && ime.backend.HasSession() {
+			if after := ime.backend.GetOption("ascii_mode"); after != beforeASCII {
+				ime.attachAsciiModeSettingsUpdate(resp, after)
+			}
+		}
+		return result
 	case "onMenu":
 		return ime.onMenu(req, resp)
 	case "highlightCandidate":
@@ -405,6 +422,16 @@ func (ime *IME) HandleRequest(req *imecore.Request) *imecore.Response {
 	case "deleteCandidateOnCurrentPage":
 		return ime.deleteCandidateOnCurrentPage(req, resp)
 	case "typeduckSettingsUpdate":
+		if req.TypeDuckSettings != nil && req.TypeDuckSettings.AsciiMode != nil {
+			ime.applyAsciiModeFromSettingsUpdate(req, resp, *req.TypeDuckSettings.AsciiMode)
+			if !req.TypeDuckSettings.HasRimePrefs {
+				// ascii-only update: no yaml regeneration, no incremental
+				// reload, no redeploy.
+				resp.ReturnValue = 1
+				resp.CustomizeUI = ime.customizeUIMap()
+				return resp
+			}
+		}
 		if ime.applyTypeDuckPreferences(req, resp) {
 			resp.ReturnValue = 1
 			resp.CustomizeUI = ime.customizeUIMap()
@@ -454,8 +481,125 @@ func (ime *IME) onPreservedKey(req *imecore.Request, resp *imecore.Response) *im
 	return resp
 }
 
+func (ime *IME) resetShiftToggleState() {
+	ime.shiftTogglePending = false
+	ime.shiftToggleUpPending = false
+	ime.shiftToggleCommitRaw = ""
+}
+
+func (ime *IME) handleShiftToggleKeyDownFilter(req *imecore.Request, resp *imecore.Response) bool {
+	if req == nil {
+		return false
+	}
+	if req.KeyCode != vkShift {
+		ime.resetShiftToggleState() // any other key while Shift held cancels the toggle
+		return false
+	}
+	if req.KeyStates.IsKeyDown(vkControl) || req.KeyStates.IsKeyDown(vkMenu) {
+		ime.resetShiftToggleState() // Ctrl/Alt+Shift chord: legacy path forwards to rime
+		return false
+	}
+	// Bare Shift-down: arm; idempotent across keyboard auto-repeat. Never
+	// forwarded to rime; NOT eaten.
+	ime.shiftTogglePending = true
+	ime.shiftToggleUpPending = false
+	ime.shiftToggleCommitRaw = ""
+	ime.lastKeyDownCode = req.KeyCode
+	ime.lastKeySkip = 0
+	ime.lastKeyDownRet = false
+	ime.lastKeyUpCode = 0
+	resp.ReturnValue = 0
+	return true
+}
+
+func (ime *IME) handleShiftToggleKeyUpFilter(req *imecore.Request, resp *imecore.Response) bool {
+	if req == nil || req.KeyCode != vkShift {
+		return false
+	}
+	if req.KeyStates.IsKeyDown(vkControl) || req.KeyStates.IsKeyDown(vkMenu) {
+		return false // chord release: legacy path (pending already cancelled on chord keydown)
+	}
+	if ime.lastKeyUpCode == req.KeyCode { // filter/on duplication guard
+		ime.lastKeyUpCode = 0
+		resp.ReturnValue = boolToInt(ime.lastKeyUpRet)
+		return true
+	}
+	ime.lastKeyUpCode = req.KeyCode
+	toggled := false
+	if ime.shiftTogglePending {
+		ime.shiftTogglePending = false
+		toggled = ime.performShiftAsciiToggle(req, resp)
+	}
+	ime.lastKeyUpRet = toggled
+	ime.lastKeyDownCode = 0
+	ime.lastKeySkip = 0
+	resp.ReturnValue = boolToInt(toggled)
+	return true // bare Shift-up never reaches processKey/rime, toggled or not
+}
+
+func (ime *IME) performShiftAsciiToggle(req *imecore.Request, resp *imecore.Response) bool {
+	ime.createSession(resp)
+	if ime.backend == nil || !ime.backendReady() || !ime.backend.HasSession() {
+		return false // degraded: pass Shift through, no toggle
+	}
+	newValue := !ime.backend.GetOption("ascii_mode")
+	raw := ""
+	if newValue { // entering English with a live composition: commit RAW typed letters
+		state := ime.backend.State()
+		if state.Composition != "" || len(state.Candidates) > 0 {
+			raw = state.RawInput // librime get_input == exactly the typed letters
+			if raw == "" {
+				raw = ime.rawInputTracked // fallback (older rime.dll without get_input)
+			}
+			ime.backend.ClearComposition()
+		}
+	}
+	ime.backend.SetOption("ascii_mode", newValue)
+	ime.resetAIState()
+	ime.resetCustomPhraseOverlay()
+	ime.resetSuperAbbrevOverlay()
+	ime.resetSecondSelectionShortcut()
+	ime.resetTrackedRawInput()
+	ime.keyComposing = false
+	ime.shiftToggleCommitRaw = raw
+	ime.shiftToggleUpPending = true
+	ime.syncSharedInputStateFromBackendIfChanged()
+	ime.attachAsciiModeSettingsUpdate(resp, newValue)
+	ime.updateLangStatus(req, resp)
+	debugLogf("shift toggle ascii_mode=%t rawLen=%d", newValue, len(raw))
+	return true
+}
+
+func (ime *IME) handleShiftToggleKeyUp(req *imecore.Request, resp *imecore.Response) bool {
+	if req == nil || req.KeyCode != vkShift || !ime.shiftToggleUpPending {
+		return false
+	}
+	ime.shiftToggleUpPending = false
+	raw := ime.shiftToggleCommitRaw
+	ime.shiftToggleCommitRaw = ""
+	ime.lastKeyUpCode = 0 // release consumed; the next bare Shift-up starts a fresh cycle
+	ime.clearResponse(resp)
+	if raw != "" {
+		resp.CommitString = raw // the raw letters, NOT the highlighted candidate
+	}
+	ime.updateLangStatus(req, resp)
+	resp.ReturnValue = 1
+	return true
+}
+
+func (ime *IME) attachAsciiModeSettingsUpdate(resp *imecore.Response, value bool) {
+	if resp == nil {
+		return
+	}
+	v := value
+	resp.TypeDuckSettingsUpdate = &imecore.TypeDuckSettingsUpdate{AsciiMode: &v}
+}
+
 func (ime *IME) filterKeyDown(req *imecore.Request, resp *imecore.Response) *imecore.Response {
 	defer ime.flushPendingActivationUI(req, resp)
+	if ime.handleShiftToggleKeyDownFilter(req, resp) {
+		return resp
+	}
 	if ime.handleSuperAbbrevKeyDownFilter(req, resp) {
 		return resp
 	}
@@ -509,6 +653,9 @@ func (ime *IME) flushPendingActivationUI(req *imecore.Request, resp *imecore.Res
 }
 
 func (ime *IME) filterKeyUp(req *imecore.Request, resp *imecore.Response) *imecore.Response {
+	if ime.handleShiftToggleKeyUpFilter(req, resp) {
+		return resp
+	}
 	if ime.handleSuperAbbrevKeyUpFilter(req, resp) {
 		return resp
 	}
@@ -577,6 +724,9 @@ func (ime *IME) onKeyDown(req *imecore.Request, resp *imecore.Response) *imecore
 }
 
 func (ime *IME) onKeyUp(req *imecore.Request, resp *imecore.Response) *imecore.Response {
+	if ime.handleShiftToggleKeyUp(req, resp) {
+		return resp
+	}
 	if ime.handleSuperAbbrevKeyUp(req, resp) {
 		return resp
 	}
@@ -615,6 +765,7 @@ func (ime *IME) onCompositionTerminated(req *imecore.Request, resp *imecore.Resp
 	ime.resetAIState()
 	ime.resetSuperAbbrevOverlay()
 	ime.resetSecondSelectionShortcut()
+	ime.resetShiftToggleState()
 	ime.resetTrackedRawInput()
 	if req.Forced {
 		ime.destroySession(resp)
@@ -1135,7 +1286,9 @@ func (ime *IME) processKey(req *imecore.Request, isUp bool) bool {
 		ime.logShortcutTrace(req, isUp, translatedKeyCode, modifiers, backendRet, handled)
 		return true
 	}
-	if (req.KeyCode == vkShift || req.KeyCode == vkCapital) &&
+	// Bare Shift never reaches this path anymore; the Shift toggle state
+	// machine intercepts it in the filter handlers.
+	if req.KeyCode == vkCapital &&
 		(modifiers == 0 || modifiers == releaseMask) {
 		handled = true
 		ime.logShortcutTrace(req, isUp, translatedKeyCode, modifiers, backendRet, handled)
@@ -1183,8 +1336,6 @@ func (ime *IME) shouldSyncSharedInputStateAfterProcessKey(req *imecore.Request, 
 		return false
 	}
 	switch req.KeyCode {
-	case vkShift:
-		return isUp
 	case vkCapital:
 		return !isUp
 	default:
@@ -1974,6 +2125,7 @@ func (ime *IME) destroySession(resp *imecore.Response) {
 	ime.resetAIState()
 	ime.resetCustomPhraseOverlay()
 	ime.resetSecondSelectionShortcut()
+	ime.resetShiftToggleState()
 	ime.resetTrackedRawInput()
 	ime.clearResponse(resp)
 	if ime.backend != nil {
@@ -2791,11 +2943,8 @@ func (ime *IME) shareableOptionNames() []string {
 		return nil
 	}
 	names := ime.backend.SaveOptions()
-	if len(names) == 0 {
-		return nil
-	}
-	unique := make([]string, 0, len(names))
-	seen := make(map[string]struct{}, len(names))
+	unique := make([]string, 0, len(names)+1)
+	seen := make(map[string]struct{}, len(names)+1)
 	for _, name := range names {
 		name = strings.TrimSpace(name)
 		if name == "" {
@@ -2806,6 +2955,12 @@ func (ime *IME) shareableOptionNames() []string {
 		}
 		seen[name] = struct{}{}
 		unique = append(unique, name)
+	}
+	// ascii_mode is the product's core shared input state. The deployed
+	// TypeDuck schema omits it from switcher/save_options, so cross-session
+	// sync must not depend on the schema listing it.
+	if _, ok := seen["ascii_mode"]; !ok {
+		unique = append(unique, "ascii_mode")
 	}
 	return unique
 }

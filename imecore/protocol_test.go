@@ -143,6 +143,71 @@ func TestBuildProtoResponseIncludesCustomizeUIBooleans(t *testing.T) {
 	}
 }
 
+func TestParseProtoRequestMapsTypeDuckAsciiMode(t *testing.T) {
+	asciiMode := true
+	req := ParseProtoRequest(&moqipb.ClientRequest{
+		Method: moqipb.Method_METHOD_TYPEDUCK_SETTINGS_UPDATE,
+		SeqNum: 5,
+		TypeduckSettingsUpdate: &moqipb.TypeDuckSettingsUpdate{
+			AsciiMode: &asciiMode,
+		},
+	})
+
+	if req.TypeDuckSettings == nil {
+		t.Fatal("expected TypeDuckSettings to be present")
+	}
+	if req.TypeDuckSettings.AsciiMode == nil || !*req.TypeDuckSettings.AsciiMode {
+		t.Fatalf("expected AsciiMode=true, got %#v", req.TypeDuckSettings.AsciiMode)
+	}
+	if req.TypeDuckSettings.HasRimePrefs {
+		t.Fatal("expected ascii-only update to report HasRimePrefs=false")
+	}
+
+	pageSize := uint32(8)
+	req = ParseProtoRequest(&moqipb.ClientRequest{
+		Method: moqipb.Method_METHOD_TYPEDUCK_SETTINGS_UPDATE,
+		SeqNum: 6,
+		TypeduckSettingsUpdate: &moqipb.TypeDuckSettingsUpdate{
+			AsciiMode: &asciiMode,
+			PageSize:  &pageSize,
+		},
+	})
+
+	if req.TypeDuckSettings == nil || req.TypeDuckSettings.AsciiMode == nil || !*req.TypeDuckSettings.AsciiMode {
+		t.Fatalf("expected AsciiMode=true with page size present, got %#v", req.TypeDuckSettings)
+	}
+	if !req.TypeDuckSettings.HasRimePrefs {
+		t.Fatal("expected update with page size to report HasRimePrefs=true")
+	}
+}
+
+func TestBuildProtoResponseSurfacesTypeDuckSettingsUpdate(t *testing.T) {
+	asciiMode := true
+	resp := NewResponse(7, true)
+	resp.TypeDuckSettingsUpdate = &TypeDuckSettingsUpdate{AsciiMode: &asciiMode}
+
+	msg, err := BuildProtoResponse("client-1", resp)
+	if err != nil {
+		t.Fatalf("BuildProtoResponse failed: %v", err)
+	}
+	update := msg.GetTypeduckSettingsUpdate()
+	if update == nil {
+		t.Fatal("expected typeduck_settings_update to be present")
+	}
+	if update.AsciiMode == nil || !update.GetAsciiMode() {
+		t.Fatalf("expected ascii_mode=true, got %#v", update.AsciiMode)
+	}
+
+	plain := NewResponse(8, true)
+	plainMsg, err := BuildProtoResponse("client-1", plain)
+	if err != nil {
+		t.Fatalf("BuildProtoResponse failed: %v", err)
+	}
+	if plainMsg.GetTypeduckSettingsUpdate() != nil {
+		t.Fatalf("expected plain response to omit typeduck_settings_update, got %#v", plainMsg.GetTypeduckSettingsUpdate())
+	}
+}
+
 func TestBuildProtoResponseOmitsUnsetCandidateCursor(t *testing.T) {
 	resp := NewResponse(3, true)
 	resp.ShowCandidates = true

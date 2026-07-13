@@ -348,13 +348,6 @@ func (ime *IME) saveAppearancePrefs() {
 }
 
 func (ime *IME) saveAppearancePrefsWithReason(reason string) {
-	path := userAppearanceConfigPath()
-	if path == "" {
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return
-	}
 	theme := ime.style.CandidateTheme
 	fontFace := ime.style.FontFace
 	fontPoint := ime.style.FontPoint
@@ -408,10 +401,7 @@ func (ime *IME) saveAppearancePrefsWithReason(reason string) {
 	if len(ime.syncedSchemaBySchemeSet) > 0 {
 		cfg.CurrentSchemaBySchemeSet = cloneStringMap(ime.syncedSchemaBySchemeSet)
 	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return
-	}
+	path := userAppearanceConfigPath()
 	debugLogf("saveAppearancePrefs triggered_by=%s path=%q candidate_per_row=%d candidate_count=%d inline_preedit=%t input_state_shared=%t auto_pair_quotes=%t semicolon_select_second=%t theme=%q",
 		strings.TrimSpace(reason),
 		path,
@@ -423,8 +413,14 @@ func (ime *IME) saveAppearancePrefsWithReason(reason string) {
 		semicolonSelectSecond,
 		theme,
 	)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return
+	// Disk persistence is optional; the in-memory publish below is what keeps
+	// live sessions in sync across instances.
+	if path != "" {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
+			if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+				_ = os.WriteFile(path, data, 0o644)
+			}
+		}
 	}
 	ime.appearanceVersion = setSharedAppearanceConfig(cfg)
 }
@@ -606,6 +602,25 @@ func (ime *IME) writeTypeDuckRimeCustomSettings(prefs typeDuckRimePreferences) b
 	}
 	debugLogf("TypeDuck settings file fallback wrote default=%q common=%q", defaultPath, commonPath)
 	return true
+}
+
+// applyAsciiModeFromSettingsUpdate applies a launcher-pushed ascii_mode as a
+// live engine option and publishes it to the shared in-memory config; live
+// sessions pick it up via syncAppearancePrefs. The applied value is echoed
+// back so the launcher persist hook converges (it is idempotent
+// load-compare-save, so the echo cannot ping-pong).
+func (ime *IME) applyAsciiModeFromSettingsUpdate(req *imecore.Request, resp *imecore.Response, value bool) {
+	ime.createSession(resp)
+	if ime.backend != nil && ime.backendReady() {
+		ime.backend.SetOption("ascii_mode", value)
+	}
+	if ime.sharedOptions == nil {
+		ime.sharedOptions = make(map[string]bool)
+	}
+	ime.sharedOptions["ascii_mode"] = value
+	ime.saveAppearancePrefsWithReason("typeduckSettingsUpdate:ascii_mode")
+	ime.attachAsciiModeSettingsUpdate(resp, value)
+	ime.updateLangStatus(req, resp)
 }
 
 func (ime *IME) applyTypeDuckPreferences(req *imecore.Request, resp *imecore.Response) bool {

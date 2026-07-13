@@ -77,6 +77,8 @@ type TypeDuckSettingsUpdate struct {
 	EnableSentence   bool
 	EnableLearning   bool
 	IsCangjie5       bool
+	AsciiMode        *bool // nil = not present in the update
+	HasRimePrefs     bool  // any yaml-affecting field was present in the proto update
 }
 
 // ButtonInfo 按钮信息
@@ -146,35 +148,36 @@ type AutoPairRule struct {
 
 // Response Moqi响应结构
 type Response struct {
-	SeqNum                int
-	Success               bool
-	ReturnValue           int
-	ReturnData            interface{}
-	CompositionString     string
-	CommitString          string
-	CandidateList         []string
-	CandidateEntries      []CandidateEntry
-	ShowCandidates        bool
-	CursorPos             int
-	CompositionCursor     int
-	CandidateCursor       int
-	HasCandidateCursor    bool
-	SelStart              int
-	SelEnd                int
-	SetSelKeys            string
-	Message               string
-	Error                 string
-	CustomizeUI           map[string]interface{}
-	AddButton             []ButtonInfo
-	RemoveButton          []string
-	ChangeButton          []ButtonInfo
-	ShowMessage           *MessageWindow
-	TrayNotification      *TrayNotification
-	HideMessage           bool
-	OpenKeyboard          bool
-	AddPreservedKey       []PreservedKeyInfo
-	RemovePreservedKey    []string
-	TypeDuckCandidatePage *TypeDuckCandidatePage
+	SeqNum                 int
+	Success                bool
+	ReturnValue            int
+	ReturnData             interface{}
+	CompositionString      string
+	CommitString           string
+	CandidateList          []string
+	CandidateEntries       []CandidateEntry
+	ShowCandidates         bool
+	CursorPos              int
+	CompositionCursor      int
+	CandidateCursor        int
+	HasCandidateCursor     bool
+	SelStart               int
+	SelEnd                 int
+	SetSelKeys             string
+	Message                string
+	Error                  string
+	CustomizeUI            map[string]interface{}
+	AddButton              []ButtonInfo
+	RemoveButton           []string
+	ChangeButton           []ButtonInfo
+	ShowMessage            *MessageWindow
+	TrayNotification       *TrayNotification
+	HideMessage            bool
+	OpenKeyboard           bool
+	AddPreservedKey        []PreservedKeyInfo
+	RemovePreservedKey     []string
+	TypeDuckCandidatePage  *TypeDuckCandidatePage
+	TypeDuckSettingsUpdate *TypeDuckSettingsUpdate
 }
 
 func NewResponse(seqNum int, success bool) *Response {
@@ -274,6 +277,13 @@ func ParseProtoRequest(msg *moqipb.ClientRequest) *Request {
 		if update.IsCangjie5 != nil {
 			settings.IsCangjie5 = update.GetIsCangjie5()
 		}
+		if update.AsciiMode != nil {
+			v := update.GetAsciiMode()
+			settings.AsciiMode = &v
+		}
+		settings.HasRimePrefs = update.PageSize != nil || update.CandidatePageSize != nil ||
+			update.EnableCompletion != nil || update.EnableCorrection != nil ||
+			update.EnableSentence != nil || update.EnableLearning != nil || update.IsCangjie5 != nil
 		req.TypeDuckSettings = &settings
 	}
 
@@ -327,6 +337,13 @@ func BuildProtoResponse(clientID string, resp *Response) (*moqipb.ServerResponse
 			HasPrevious: resp.TypeDuckCandidatePage.HasPrevious,
 			HasNext:     resp.TypeDuckCandidatePage.HasNext,
 		}
+	}
+	if resp.TypeDuckSettingsUpdate != nil {
+		update := &moqipb.TypeDuckSettingsUpdate{}
+		if resp.TypeDuckSettingsUpdate.AsciiMode != nil {
+			update.AsciiMode = boolPtr(*resp.TypeDuckSettingsUpdate.AsciiMode)
+		}
+		msg.TypeduckSettingsUpdate = update
 	}
 	if resp.ShowMessage != nil {
 		msg.ShowMessage = &moqipb.MessageWindow{
