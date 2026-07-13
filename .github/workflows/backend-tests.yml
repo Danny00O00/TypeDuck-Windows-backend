@@ -1,0 +1,72 @@
+---
+# Backend test CI.
+#
+# WHY THIS EXISTS: the Shift/asciiMode tests that guard this repo's own code only ever ran from the
+# FRONTEND repo's nightly/release workflows. Anyone editing the backend alone -- push or PR -- got
+# no test run at all. This workflow closes that gap.
+#
+# It deliberately runs the SAME script the frontend workflows call
+# (.github/workflows/Invoke-TypeDuckBackendTests.ps1), so the test scoping and the Shift/asciiMode
+# coverage guard cannot drift between the two repos.
+#
+# NOTE: the neighbouring nightly.yml is broken upstream (it calls scripts/build.ps1 without
+# -RimeDataSource, which falls back to a hard-coded I:\ drive path and always fails). It is left
+# exactly as-is; this workflow stands alongside it with a distinct name and filename.
+name: Backend Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-tests:
+    name: Go tests (Shift/asciiMode guard)
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout TypeDuck-Windows-backend
+        uses: actions/checkout@v4
+
+      # windows-2022 on purpose, even though these tests never touch librime:
+      # input_methods/rime/librime.go and native_cgo.go are behind `//go:build windows`, so on any
+      # other runner the compiler would not even look at them and a build break in the real
+      # production files would sail straight through CI.
+      #
+      # This needs no librime build and no rime.dll: librime.go loads the DLL through
+      # syscall.NewLazyDLL at RUNTIME (only android uses cgo), so the package compiles standalone,
+      # and the feature tests drive an in-process fake backend that never calls into it.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Pinned to the same version as the TypeDuck-Windows nightly/release workflows.
+          go-version: "1.24.6"
+          cache-dependency-path: go.sum
+
+      # gofmt and `go vet` are deliberately NOT wired in: both are already RED on a clean upstream
+      # checkout, and this workflow is not the place to ship a red CI.
+      #   * gofmt -l reports 3 pre-existing upstream files (input_methods/fcitx5/fcitx5.go,
+      #     input_methods/rime/cloud_clipboard_password_stub.go,
+      #     input_methods/rime/t9_separator_runtime_test.go).
+      #   * GOOS=windows go vet ./... exits 1 on 6 "possible misuse of unsafe.Pointer" findings in
+      #     the upstream input_methods/rime/librime.go DLL bindings. (It is clean on darwin/linux
+      #     only because librime.go is windows-gated -- so vetting on this runner is exactly the
+      #     configuration that fails.)
+      # Fix those upstream files first, then add the checks here in the same step.
+      - name: Run backend Go tests
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass `
+            -File .\.github\workflows\Invoke-TypeDuckBackendTests.ps1 `
+            -RepoRoot "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Backend Go tests failed."
+          }
